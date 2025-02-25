@@ -1,0 +1,148 @@
+1. Instalar Kind
+Si aún no lo tienes, instala Kind. Por ejemplo, usando Go:
+  
+GO111MODULE="on" go get sigs.k8s.io/kind@v0.17.0
+O bien descarga el binario desde Kind Releases.
+
+2. Crear un clúster Kind con mapeo de puertos para Ingress
+Crea un archivo de configuración (por ejemplo, clusterconfig.yaml) con el siguiente contenido.
+Nota: La API actual es kind.x-k8s.io/v1alpha4:
+
+yaml
+  
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraPortMappings:
+    - containerPort: 31080
+      hostPort: 80
+      protocol: TCP
+    - containerPort: 31443
+      hostPort: 443
+      protocol: TCP
+Crea el clúster:
+
+kind create cluster --name knative-cluster --config clusterconfig.yaml
+
+
+Verifica el clúster:
+
+kubectl cluster-info --context kind-knative-cluster
+3. Instalar los componentes de Knative Serving
+a) Instalar los CRD de Knative Serving
+ 
+  
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.0.0/serving-crds.yaml
+kubectl wait --for=condition=Established --all crd
+b) Instalar los componentes centrales de Knative Serving
+ 
+  
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.0.0/serving-core.yaml
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-serving > /dev/null
+4. Instalar Kourier (Networking) para Knative
+a) Instalar Kourier
+ 
+  
+kubectl apply -f https://github.com/knative/net-kourier/releases/download/knative-v1.0.0/kourier.yaml
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n kourier-system
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-serving
+b) Configurar DNS con nip.io
+Definamos la variable para el dominio. En un entorno Kind, usaremos la IP del host (usualmente 127.0.0.1):
+
+ 
+  
+EXTERNAL_IP="127.0.0.1"
+KNATIVE_DOMAIN="$EXTERNAL_IP.nip.io"
+echo "KNATIVE_DOMAIN=$KNATIVE_DOMAIN"
+Verifica (por ejemplo, con dig):
+
+ 
+  
+dig $KNATIVE_DOMAIN
+Luego, parchea el ConfigMap config-domain en el namespace knative-serving:
+
+ 
+  
+kubectl patch configmap -n knative-serving config-domain \
+  --type merge \
+  --patch "{\"data\": {\"$KNATIVE_DOMAIN\": \"\"}}"
+c) Crear (o corregir) el Service para Kourier
+Crea un archivo llamado kourier.yaml con el siguiente contenido (nota la mayúscula en nodePort y targetPort):
+
+yaml
+  
+apiVersion: v1
+kind: Service
+metadata:
+  name: kourier-ingress
+  namespace: kourier-system
+  labels:
+    networking.knative.dev/ingress-provider: kourier
+spec:
+  type: NodePort
+  selector:
+    app: 3scale-kourier-gateway
+  ports:
+    - name: http2
+      nodePort: 31080
+      port: 80
+      targetPort: 8080
+    - name: https
+      nodePort: 31443
+      port: 443
+      targetPort: 8443
+Aplica el service:
+
+ 
+  
+kubectl apply -f kourier.yaml
+d) Configurar Knative para usar Kourier
+ 
+  
+kubectl patch configmap/config-network \
+  --namespace knative-serving \
+  --type merge \
+  --patch '{"data":{"ingress.class":"kourier.ingress.networking.knative.dev"}}'
+5. Verificar que todo esté listo
+Comprueba los pods en los namespaces knative-serving y kourier-system:
+
+ 
+  
+kubectl get pods -n knative-serving
+kubectl get pods -n kourier-system
+6. Desplegar una aplicación Knative
+Utiliza el CLI kn (instálalo desde Kn CLI Releases) para crear un servicio de ejemplo:
+
+ 
+  
+kn service create hello \
+  --image gcr.io/knative-samples/helloworld-go \
+  --port 8080 \
+  --env TARGET=Knative
+Espera a que el servicio esté listo:
+
+ 
+  
+kubectl wait ksvc hello --all --timeout=-1s --for=condition=Ready
+Ahora, asegúrate de que el ConfigMap config-domain tenga el dominio correcto (como hicimos antes):
+
+ 
+  
+kubectl patch configmap -n knative-serving config-domain \
+  --type merge \
+  --patch "{\"data\": {\"$KNATIVE_DOMAIN\": \"\"}}"
+Obtén la URL del servicio:
+
+  
+SERVICE_URL=$(kubectl get ksvc hello -o jsonpath='{.status.url}')
+echo $SERVICE_URL
+# Debería mostrar algo similar a: http://hello.default.127.0.0.1.nip.io
+Prueba la aplicación:
+
+ 
+  
+curl $SERVICE_URL
+Deberías ver una respuesta similar a:
+
+Hello Knative!
